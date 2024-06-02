@@ -3,6 +3,7 @@ using Microsoft.WindowsAPICodePack.Dialogs;
 using NAudio.Vorbis;
 using NAudio.Wave;
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Data;
 using System.Drawing;
@@ -12,6 +13,7 @@ using System.IO.Compression;
 using System.Linq;
 using System.Reflection;
 using System.Runtime.InteropServices;
+using System.Threading.Tasks;
 using System.Windows.Forms;
 using System.Windows.Markup;
 using ThimbleweedLibrary;
@@ -242,9 +244,9 @@ namespace ThimbleweedParkExplorer
     //************************************************Save handlers*********************************************************************
 
     //Save all files handler
-    private void SaveAllHandler(object sender, EventArgs e)
+    private async void SaveAllHandler(object sender, EventArgs e)
     {
-      if (Thimbles == null || Thimbles.SelectMany(t=>t.BundleFiles).ToList().Count == 0)
+      if (Thimbles == null || Thimbles.SelectMany(t => t.BundleFiles).ToList().Count == 0)
         return;
 
       var bundleFiles = Thimbles.SelectMany(t => t.BundleFiles).ToList();
@@ -300,7 +302,7 @@ namespace ThimbleweedParkExplorer
 
         try
         {
-          log(SavingMessage);
+          log($"{SavingMessage} at {DateTime.Now.ToString("HH:mm:ss")}");
           EnableDisableControls(false);
           panelProgress.Visible = true;
           panelProgress.BringToFront();
@@ -310,62 +312,104 @@ namespace ThimbleweedParkExplorer
           progressBar1.Step = 1;
           progressBar1.Value = 0;
 
+          int progress = 0;
+          var progressLock = new object();
+
           //Save visible uses different technique for dumping
           if (sender.Equals(toolStripSaveAllVisible))
           {
             progressBar1.Maximum = objectListView1.Items.Count; //Count of filtered items
+            var bundleFilesDict = bundleFiles.ToDictionary(item => item, item => item);
+
+            ConcurrentBag<BundleEntry> itemsToProcess = new ConcurrentBag<BundleEntry>();
+
             foreach (var item in objectListView1.FilteredObjects)
             {
-              int index = bundleFiles.IndexOf((BundleEntry)item);
-              if (index == -1)
-                continue;
-              var bundleFile = bundleFiles[index];
-              SaveFile(bundleFile, openFolder.FileName, false); //No autodecode for raw dumps
-              progressBar1.PerformStep();
-              Application.DoEvents(); //HACK use backgroundworker or async task in future
+              itemsToProcess.Add((BundleEntry)item);
             }
+
+            await Task.Run(() =>
+            {
+              Parallel.ForEach(itemsToProcess, new ParallelOptions { MaxDegreeOfParallelism = Environment.ProcessorCount }, item =>
+              {
+                if (bundleFilesDict.TryGetValue(item, out var bundleFile))
+                {
+                  SaveFile(bundleFile, openFolder.FileName, false); // No autodecode for raw dumps
+                  lock (progressLock)
+                  {
+                    progress++;
+                    progressBar1.Invoke(new Action(() => progressBar1.Value = progress));
+                  }
+                }
+              });
+            });
+
+            // Update progress bar after processing is complete
+            progressBar1.Value = progressBar1.Maximum;
           }
           else
           {
-            for (int i = 0; i < bundleFiles.Count; i++)
-            {
-              if (TargetFileType == BundleEntry.FileTypes.None) //Dump all raw files
-                SaveFile(bundleFiles[i], openFolder.FileName, false);
-              else if ((TargetFileType == BundleEntry.FileTypes.Sound) && (bundleFiles[i].FileType == BundleEntry.FileTypes.Soundbank)) //Soundbank.
-              {
-                //This duplicates the SaveAll functionality in SoundBankViewer so TODO refactor
-                using (MemoryStream ms = new MemoryStream())
-                {
-                  bundleFiles[i].Extract(ms);
-                  ms.Position = 0;
-                  var extractor = new FMODBankExtractor(ms);
-                  extractor.LogEvent += text => log(text);
-                  extractor.SaveAllToDir(openFolder.FileName);
-                }
-              }
-              else if ((TargetFileType == BundleEntry.FileTypes.Image) && (bundleFiles[i].FileExtension == "ktxbz")) //KTX images, decode to png.
-              {
-                byte[] ktxData;
-                using (var memstr = new MemoryStream())
-                {
-                  bundleFiles[i].Extract(memstr);
-                  ktxData = DecompressStream(memstr);
-                  ktxData = KtxToPng(new MemoryStream(ktxData));
-                  File.WriteAllBytes(Path.Combine(openFolder.FileName, Path.GetFileNameWithoutExtension(bundleFiles[i].FileName) + ".png"), ktxData);
-                }
-              }
-              //quick hack to save ggdict as text
-              else if ((TargetFileType == BundleEntry.FileTypes.Text) && (bundleFiles[i].FileType == BundleEntry.FileTypes.GGDict))
-                SaveFile(bundleFiles[i], openFolder.FileName, true);
-              else if (TargetFileType == bundleFiles[i].FileType) //Other types. Sound/image/text etc
-                SaveFile(bundleFiles[i], openFolder.FileName, true);
+            ConcurrentBag<BundleEntry> itemsToProcess = new ConcurrentBag<BundleEntry>(bundleFiles);
 
-              progressBar1.PerformStep();
-              Application.DoEvents(); //HACK use backgroundworker or async task in future
-            }
+            await Task.Run(() =>
+            {
+              Parallel.ForEach(itemsToProcess, new ParallelOptions { MaxDegreeOfParallelism = Environment.ProcessorCount }, item =>
+              {
+                try
+                {
+                  if (TargetFileType == BundleEntry.FileTypes.None) // Dump all raw files
+                  {
+                    SaveFile(item, openFolder.FileName, false);
+                  }
+                  else if (TargetFileType == BundleEntry.FileTypes.Sound && item.FileType == BundleEntry.FileTypes.Soundbank) // Soundbank
+                  {
+                    using (MemoryStream ms = new MemoryStream())
+                    {
+                      item.Extract(ms);
+                      ms.Position = 0;
+                      var extractor = new FMODBankExtractor(ms);
+                      extractor.LogEvent += text => log(text);
+                      extractor.SaveAllToDir(openFolder.FileName);
+                    }
+                  }
+                  else if (TargetFileType == BundleEntry.FileTypes.Image && item.FileExtension == "ktxbz") // KTX images, decode to png
+                  {
+                    byte[] ktxData;
+                    using (var memstr = new MemoryStream())
+                    {
+                      item.Extract(memstr);
+                      ktxData = DecompressStream(memstr);
+                      ktxData = KtxToPng(new MemoryStream(ktxData));
+                      File.WriteAllBytes(Path.Combine(openFolder.FileName, Path.GetFileNameWithoutExtension(item.FileName) + ".png"), ktxData);
+                    }
+                  }
+                  else if (TargetFileType == BundleEntry.FileTypes.Text && item.FileType == BundleEntry.FileTypes.GGDict) // Save ggdict as text
+                  {
+                    SaveFile(item, openFolder.FileName, true);
+                  }
+                  else if (TargetFileType == item.FileType) // Other types: Sound/image/text, etc.
+                  {
+                    SaveFile(item, openFolder.FileName, true);
+                  }
+
+                  // Update progress safely
+                  lock (progressLock)
+                  {
+                    progress++;
+                    progressBar1.Invoke(new Action(() => progressBar1.Value = progress));
+                  }
+                }
+                catch (Exception ex)
+                {
+                  // Log or handle the exception as needed
+                  log($"Error processing item: {ex.Message}");
+                }
+              });
+            });
           }
 
-          log("...done!");
+          log($"...done! at {DateTime.Now.ToString("HH:mm:ss")}");
+          progressBar1.Invoke(new Action(() => progressBar1.Value = progressBar1.Maximum));
         }
         finally
         {
@@ -381,14 +425,14 @@ namespace ThimbleweedParkExplorer
       var pathAndFileName = Path.Combine(outputFileName, bundleFile.FileName);
       using (Stream file = File.Create(pathAndFileName))
       {
-        bundleFile.Extract(file,v);
+        bundleFile.Extract(file, v);
       }
     }
 
     //Save single file handler
     private void SaveFileAsHandler(object sender, EventArgs e)
     {
-      if (Thimbles == null || Thimbles.SelectMany(t=>t.BundleFiles).ToList().Count == 0 || objectListView1.SelectedIndex == -1)
+      if (Thimbles == null || Thimbles.SelectMany(t => t.BundleFiles).ToList().Count == 0 || objectListView1.SelectedIndex == -1)
         return;
 
       saveFileDialog1.FileName = Path.GetFileNameWithoutExtension(((BundleEntry)objectListView1.SelectedObject).FileName);
@@ -419,7 +463,7 @@ namespace ThimbleweedParkExplorer
       if (saveFileDialog1.ShowDialog() != DialogResult.OK)
         return;
 
-      int index = Thimbles.SelectMany(t=>t.BundleFiles).ToList().IndexOf((BundleEntry)objectListView1.SelectedObject);
+      int index = Thimbles.SelectMany(t => t.BundleFiles).ToList().IndexOf((BundleEntry)objectListView1.SelectedObject);
       var bundleFile = Thimbles.SelectMany(t => t.BundleFiles).ToList()[index];
       try
       {
@@ -566,7 +610,14 @@ namespace ThimbleweedParkExplorer
     //Log string to the textbox
     private void log(string logText)
     {
-      richTextBoxLog.AppendText(logText + Environment.NewLine);
+      if (richTextBoxLog.InvokeRequired)
+      {
+        richTextBoxLog.Invoke(new Action<string>(log), logText);
+      }
+      else
+      {
+        richTextBoxLog.AppendText(logText + Environment.NewLine);
+      }
     }
 
     //Enable/disable controls depending on param
@@ -772,10 +823,20 @@ namespace ThimbleweedParkExplorer
       ms.Position = 2;
       var Decompressed = new MemoryStream();
 
-      using (var d = new DeflateStream(ms, CompressionMode.Decompress))
+      try
       {
-        d.CopyTo(Decompressed);
-        return Decompressed.ToArray();
+        using (var decompressedStream = new MemoryStream())
+        {
+          using (var d = new DeflateStream(ms, CompressionMode.Decompress))
+          {
+            d.CopyTo(decompressedStream);
+          }
+          return decompressedStream.ToArray();
+        }
+      }
+      catch (InvalidDataException)
+      {
+        throw new InvalidOperationException("Unsupported compression method or corrupted data.");
       }
     }
 
@@ -891,7 +952,7 @@ namespace ThimbleweedParkExplorer
           panelText.BringToFront();
           using (MemoryStream ms = new MemoryStream())
           {
-            bundleFile.Extract(ms);
+            bundleFile.Extract(ms, false);
 
             GGDict dict = new GGDict(ms, Thimbles.First().Cryptor.FileVersion == BundleFileVersion.Version_RtMI);
             string[] lines = dict.ToJsonString().Split('\n').Select(s => s.Trim('\r')).ToArray();
