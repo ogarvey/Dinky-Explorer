@@ -350,7 +350,7 @@ namespace ThimbleweedLibrary
             }
 
             BundleFiles[FileNo].Extract(DestStream, Autodecode);
-        }
+        } 
 
         public void SaveFile(int FileNo, string PathAndFileName, Boolean Autodecode = true)
         {

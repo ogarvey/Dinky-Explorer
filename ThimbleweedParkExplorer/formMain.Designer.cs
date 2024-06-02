@@ -89,6 +89,8 @@
       // openFileDialog1
       // 
       openFileDialog1.Filter = "Ggpack files|*.ggpack?;*.ggpack??";
+      openFileDialog1.Multiselect = true;
+      openFileDialog1.ShowReadOnly = true;
       // 
       // richTextBoxLog
       // 
